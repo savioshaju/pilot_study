@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+ENV/
+env/
+
+# Streamlit secrets & service account keys
+.streamlit/secrets.toml
+service_account.json
+*.key
+*.pem
+
+# Privacy & ignore configurations
+.antigravityignore
+
+# Participant study responses
+data/responses/
+
+# OS
+.DS_Store
+Thumbs.db
