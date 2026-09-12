@@ -126,8 +126,11 @@ def sync_to_google_sheets(flat_rows):
                     worksheet.append_rows(rows_to_append)
                 else:
                     existing_headers = existing_values[0]
-                    # If old format is present (has 'sentence_id'), reset to the new wide layout
-                    if "sentence_id" in existing_headers:
+                    # If old format is present (has 'sentence_id' or un-indexed headers), reset to new layout
+                    is_old_format = ("sentence_id" in existing_headers) or any(
+                        not h.startswith("Q") and ' - "' in h for h in existing_headers
+                    )
+                    if is_old_format:
                         worksheet.clear()
                         worksheet.append_row(headers)
                         existing_headers = headers
@@ -156,10 +159,10 @@ def sync_to_google_sheets(flat_rows):
 
 def save_participant_response(participant_info, responses):
     """
-    Saves the participant's demographic data and trial selections in a SINGLE ROW.
+    Saves the participant's demographic data and ALL N trial selections in a SINGLE ROW.
     1. Saves individual JSON snapshot (local fail-safe)
     2. Appends to master CSV in wide format (1 participant = 1 row)
-    3. Syncs to Google Sheet in wide format with headers: <English Sentence> - "<Emphasized Word>"
+    3. Syncs to Google Sheet in wide format with headers: Q{id}: <English Sentence> - "<Emphasized Word>"
     """
     participant_id = participant_info.get("participant_id", f"P_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -187,11 +190,13 @@ def save_participant_response(participant_info, responses):
         "english_proficiency": participant_info.get("english_proficiency", ""),
     }
 
-    # Add each trial as a column: [English sentence] - "[emphasized word]"
-    for item in responses:
+    # Add each trial as a unique column: Q{s_id}: [English sentence] - "[emphasized word]"
+    # Using the question index ensures duplicate English sentences will NEVER overwrite each other
+    for idx, item in enumerate(responses):
+        s_id = item.get("sentence_id", idx + 1)
         src = item.get("source_english", "").strip()
         emph = ", ".join(item.get("emphasized_words", []))
-        col_name = f'{src} - "{emph}"' if emph else src
+        col_name = f'Q{s_id}: {src} - "{emph}"' if emph else f'Q{s_id}: {src}'
 
         opt_id = item.get("selected_option_id", "")
         opt_text = item.get("selected_target_text", "")
@@ -207,9 +212,14 @@ def save_participant_response(participant_info, responses):
     if os.path.exists(csv_path):
         try:
             df_existing = pd.read_csv(csv_path)
-            # If old format with 'sentence_id', upgrade to new wide format
-            if "sentence_id" in df_existing.columns:
-                df_combined = df_new
+            # If old format without 'Q1:' or with 'sentence_id', replace with clean wide format
+            has_old_cols = ("sentence_id" in df_existing.columns) or any(
+                not col.startswith("Q") and ' - "' in col for col in df_existing.columns
+            )
+            if has_old_cols:
+                # Rebuild all historical responses from saved JSON files
+                rebuild_and_sync_all_responses()
+                return participant_id, csv_path, True
             else:
                 df_combined = pd.concat([df_existing, df_new], ignore_index=True)
             df_combined.to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -222,4 +232,79 @@ def save_participant_response(participant_info, responses):
     gsheet_synced, gsheet_message = sync_to_google_sheets(flat_rows)
 
     return participant_id, csv_path, gsheet_synced
+
+
+def rebuild_and_sync_all_responses():
+    """
+    Rebuilds all_responses.csv and Google Sheets from all JSON records in data/responses/
+    Ensuring every participant has exactly 1 single row containing all their answered questions.
+    """
+    all_rows = []
+    if not os.path.exists(RESPONSES_DIR):
+        return False, "No responses directory."
+
+    json_files = sorted([f for f in os.listdir(RESPONSES_DIR) if f.endswith(".json")])
+    for jf in json_files:
+        filepath = os.path.join(RESPONSES_DIR, jf)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+            demographics = rec.get("demographics", {})
+            row = {
+                "participant_id": rec.get("participant_id", ""),
+                "submitted_at": rec.get("submitted_at", ""),
+                "name": demographics.get("name", ""),
+                "email": demographics.get("email", ""),
+                "age": demographics.get("age", ""),
+                "gender": demographics.get("gender", ""),
+                "malayalam_proficiency": demographics.get("malayalam_proficiency", ""),
+                "english_proficiency": demographics.get("english_proficiency", ""),
+            }
+            for idx, item in enumerate(rec.get("trial_responses", [])):
+                s_id = item.get("sentence_id", idx + 1)
+                src = item.get("source_english", "").strip()
+                emph = ", ".join(item.get("emphasized_words", []))
+                col_name = f'Q{s_id}: {src} - "{emph}"' if emph else f'Q{s_id}: {src}'
+
+                opt_id = item.get("selected_option_id", "")
+                opt_text = item.get("selected_target_text", "")
+                selected_val = f"({opt_id}) {opt_text}" if opt_id and opt_text else opt_text
+
+                row[col_name] = selected_val
+            all_rows.append(row)
+        except Exception as e:
+            print(f"Error reading {jf}: {e}")
+
+    if not all_rows:
+        return False, "No valid responses found."
+
+    df = pd.DataFrame(all_rows)
+    csv_path = os.path.join(RESPONSES_DIR, "all_responses.csv")
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    # Clear and rewrite Google Sheets with the clean master dataset
+    try:
+        import gspread
+        import streamlit as st
+        with open(os.path.join(BASE_DIR, ".streamlit", "secrets.toml"), "rb") as f:
+            import tomllib
+            secrets = tomllib.load(f)
+
+        sa_info = secrets.get("gcp_service_account")
+        sheet_target = secrets.get("google_sheets", {}).get("spreadsheet_url")
+        if sa_info and sheet_target:
+            client = gspread.service_account_from_dict(sa_info)
+            sh = client.open_by_url(sheet_target)
+            ws = sh.sheet1
+            headers = list(df.columns)
+            ws.clear()
+            ws.append_row(headers)
+            values = df.fillna("").astype(str).values.tolist()
+            ws.append_rows(values)
+            return True, "Rebuilt and synced successfully."
+    except Exception as e:
+        print(f"Failed to sync rebuilt data to Google Sheets: {e}")
+        return False, str(e)
+
+    return True, "Local CSV rebuilt."
 
